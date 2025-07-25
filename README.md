@@ -15,3 +15,8 @@ sudo ./a.out
 sudo ./a.out -i <インターフェース名>
 ```
 ここで、インターフェースの確認はifconfigでできる。
+
+## 3.tcpdumpを実行したい場合
+```
+sudo tcpdump -i eth0 
+```
