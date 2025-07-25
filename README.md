@@ -18,5 +18,23 @@ sudo ./a.out -i <インターフェース名>
 
 ## 3.tcpdumpを実行したい場合
 ```
-sudo tcpdump -i eth0 
+sudo tcpdump -i eth0 -n <プロトコル名>
+```
+それぞれのプロトコルは以下のコマンドで確認できる。
+IP,ICMP
+```
+ping 8.8.8.8
+```
+ARP
+```
+arp
+```
+TCP
+```
+curl http://example.com
+```
+UDP
+```
+nc -u example.com 10000
+hello,world
 ```
