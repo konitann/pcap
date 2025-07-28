@@ -1,6 +1,6 @@
 /*
  * if use recently libpcap, set USE_PCAP_FINDALLDEVS like following:
- *      $ cc -DUSE_PCAP_FINDALLDEVS foo.c -lpcap
+ * $ cc -DUSE_PCAP_FINDALLDEVS foo.c -lpcap
  */
 #include <pcap.h>
 #include <stdio.h>
@@ -23,6 +23,35 @@
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
 #include <net/if_arp.h>
+#include <netinet/tcp.h> 
+
+#define DATA_BUFFER_SIZE 4096 
+#define CONNECTION_TIMEOUT 300
+
+struct flow_data {
+    uint64_t packets;
+    uint64_t bytes;
+    unsigned char buffer[DATA_BUFFER_SIZE];
+    size_t buffer_len;
+};
+
+struct tcp_connection {
+    struct in_addr ip1;
+    struct in_addr ip2;
+    uint16_t port1;
+    uint16_t port2;
+
+    struct flow_data flow1_to_2; 
+    struct flow_data flow2_to_1; 
+
+    time_t last_packet_time; 
+    int fin_received;        
+
+    struct tcp_connection *next; 
+};
+
+struct tcp_connection *connection_list = NULL;
+
 
 #ifdef USE_PCAP_FINDALLDEVS
 /*インターフェースの検索と選択*/
@@ -188,6 +217,249 @@ void icmp(const u_char *data, int icmp_len, struct in_addr src_ip, struct in_add
     printf("\n");
 }
 
+void udp(const u_char *udp_data, int total_len, struct in_addr src_ip, struct in_addr dst_ip)
+{
+    struct udphdr *udp_hdr = (struct udphdr *)udp_data;
+    char src_str[INET_ADDRSTRLEN];
+    char dst_str[INET_ADDRSTRLEN];
+    int udp_len;
+    int data_len;
+    
+    strcpy(src_str, inet_ntoa(src_ip));
+    strcpy(dst_str, inet_ntoa(dst_ip));
+    
+    udp_len = ntohs(udp_hdr->uh_ulen);
+    data_len = udp_len - sizeof(struct udphdr);
+    
+    printf("IP %s.%d > %s.%d: UDP, length %d",
+           src_str, ntohs(udp_hdr->uh_sport),
+           dst_str, ntohs(udp_hdr->uh_dport),
+           data_len);
+    
+    if (ntohs(udp_hdr->uh_dport) == 53 || ntohs(udp_hdr->uh_sport) == 53) {
+        printf(" (DNS)");
+    } else if (ntohs(udp_hdr->uh_dport) == 67 || ntohs(udp_hdr->uh_sport) == 67 ||
+               ntohs(udp_hdr->uh_dport) == 68 || ntohs(udp_hdr->uh_sport) == 68) {
+        printf(" (DHCP)");
+    } else if (ntohs(udp_hdr->uh_dport) == 123 || ntohs(udp_hdr->uh_sport) == 123) {
+        printf(" (NTP)");
+    } else if (ntohs(udp_hdr->uh_dport) == 161 || ntohs(udp_hdr->uh_sport) == 161 ||
+               ntohs(udp_hdr->uh_dport) == 162 || ntohs(udp_hdr->uh_sport) == 162) {
+        printf(" (SNMP)");
+    } else if (ntohs(udp_hdr->uh_dport) == 514 || ntohs(udp_hdr->uh_sport) == 514) {
+        printf(" (syslog)");
+    } else if ((ntohs(udp_hdr->uh_dport) >= 5060 && ntohs(udp_hdr->uh_dport) <= 5061) ||
+               (ntohs(udp_hdr->uh_sport) >= 5060 && ntohs(udp_hdr->uh_sport) <= 5061)) {
+        printf(" (SIP)");
+    }
+    
+    printf("\n");
+}
+
+void print_payload(const unsigned char *payload, int len) {
+    int i;
+    const int line_width = 16;
+
+    for (i = 0; i < len; i++) {
+        if (i % line_width == 0) {
+            printf("    %04x: ", i);
+        }
+        printf("%02x ", payload[i]);
+        if (i % line_width == line_width - 1 || i == len - 1) {
+            for (int j = 0; j < line_width - 1 - (i % line_width); j++) {
+                printf("   ");
+            }
+            printf("| ");
+            for (int j = i - (i % line_width); j <= i; j++) {
+                if (payload[j] >= 32 && payload[j] <= 126) {
+                    printf("%c", payload[j]);
+                } else {
+                    printf(".");
+                }
+            }
+            printf("\n");
+        }
+    }
+}
+
+void print_and_free_connection(struct tcp_connection *conn, const char *reason) {
+    char ip1_str[INET_ADDRSTRLEN], ip2_str[INET_ADDRSTRLEN];
+    strcpy(ip1_str, inet_ntoa(conn->ip1));
+    strcpy(ip2_str, inet_ntoa(conn->ip2));
+
+    printf("\n------------------------------------------------------------\n");
+    printf("TCP Connection Closed (%s)\n", reason);
+    printf("  %s:%d <-> %s:%d\n", ip1_str, ntohs(conn->port1), ip2_str, ntohs(conn->port2));
+    printf("\n");
+    printf("  Flow: %s:%d -> %s:%d\n", ip1_str, ntohs(conn->port1), ip2_str, ntohs(conn->port2));
+    printf("    Packets: %lu\n", conn->flow1_to_2.packets);
+    printf("    Bytes: %lu\n", conn->flow1_to_2.bytes);
+    if (conn->flow1_to_2.buffer_len > 0) {
+        printf("    Data (%zu bytes):\n", conn->flow1_to_2.buffer_len);
+        print_payload(conn->flow1_to_2.buffer, conn->flow1_to_2.buffer_len);
+    }
+    printf("\n");
+    printf("  Flow: %s:%d -> %s:%d\n", ip2_str, ntohs(conn->port2), ip1_str, ntohs(conn->port1));
+    printf("    Packets: %lu\n", conn->flow2_to_1.packets);
+    printf("    Bytes: %lu\n", conn->flow2_to_1.bytes);
+     if (conn->flow2_to_1.buffer_len > 0) {
+        printf("    Data (%zu bytes):\n", conn->flow2_to_1.buffer_len);
+        print_payload(conn->flow2_to_1.buffer, conn->flow2_to_1.buffer_len);
+    }
+    printf("------------------------------------------------------------\n\n");
+    fflush(stdout);
+
+    // リストから削除
+    if (connection_list == conn) {
+        connection_list = conn->next;
+    } else {
+        struct tcp_connection *curr = connection_list;
+        while (curr && curr->next != conn) {
+            curr = curr->next;
+        }
+        if (curr) {
+            curr->next = conn->next;
+        }
+    }
+    free(conn);
+}
+
+void check_timeout_connections() {
+    time_t now = time(NULL);
+    struct tcp_connection *curr = connection_list;
+    struct tcp_connection *next = NULL;
+
+    while (curr) {
+        // 現在の要素を解放する可能性があるので、先に次の要素を保持しておく
+        next = curr->next;
+        if (now - curr->last_packet_time > CONNECTION_TIMEOUT) {
+            print_and_free_connection(curr, "Timeout");
+        }
+        curr = next;
+    }
+}
+
+const char* format_tcp_flags(uint8_t flags) {
+    static char flag_str[10];
+    memset(flag_str, 0, sizeof(flag_str));
+    strcat(flag_str, "[");
+    if (flags & TH_SYN) strcat(flag_str, "S");
+    if (flags & TH_FIN) strcat(flag_str, "F");
+    if (flags & TH_RST) strcat(flag_str, "R");
+    if (flags & TH_PUSH) strcat(flag_str, "P");
+    if (flags & TH_ACK) strcat(flag_str, "."); // ACKはドットで表現
+    strcat(flag_str, "]");
+    return flag_str;
+}
+
+
+void tcp(const u_char *data, int total_len, struct in_addr src_ip, struct in_addr dst_ip) {
+    struct tcphdr *tcp_hdr = (struct tcphdr *)data;
+    uint16_t src_port = tcp_hdr->th_sport;
+    uint16_t dst_port = tcp_hdr->th_dport;
+    int tcp_hdr_len = tcp_hdr->th_off * 4;
+    int payload_len = total_len - tcp_hdr_len;
+
+    // ★★ ここから追加: tcpdump風のリアルタイム出力 ★★
+    char src_str[INET_ADDRSTRLEN];
+    char dst_str[INET_ADDRSTRLEN];
+    strcpy(src_str, inet_ntoa(src_ip));
+    strcpy(dst_str, inet_ntoa(dst_ip));
+
+    printf("IP %s.%d > %s.%d: Flags %s, seq %u",
+           src_str, ntohs(src_port),
+           dst_str, ntohs(dst_port),
+           format_tcp_flags(tcp_hdr->th_flags),
+           ntohl(tcp_hdr->th_seq));
+
+    // ACKフラグが立っている場合のみack番号を表示
+    if (tcp_hdr->th_flags & TH_ACK) {
+        printf(", ack %u", ntohl(tcp_hdr->th_ack));
+    }
+
+    printf(", win %u, length %d\n",
+           ntohs(tcp_hdr->th_win),
+           payload_len);
+    // ★★ ここまで追加 ★★
+
+
+    // ▼▼ 以下、既存のコネクション追跡・サマリー機能はそのまま維持 ▼▼
+    struct tcp_connection *conn = NULL;
+    struct tcp_connection *curr = connection_list;
+
+    // 既存コネクションを検索
+    while (curr) {
+        if ((curr->ip1.s_addr == src_ip.s_addr && curr->port1 == src_port &&
+             curr->ip2.s_addr == dst_ip.s_addr && curr->port2 == dst_port) ||
+            (curr->ip1.s_addr == dst_ip.s_addr && curr->port1 == dst_port &&
+             curr->ip2.s_addr == src_ip.s_addr && curr->port2 == src_port)) {
+            conn = curr;
+            break;
+        }
+        curr = curr->next;
+    }
+
+    // 新規コネクション (SYNパケット)
+    if (!conn && (tcp_hdr->th_flags & TH_SYN) && !(tcp_hdr->th_flags & TH_ACK)) {
+        conn = (struct tcp_connection *)malloc(sizeof(struct tcp_connection));
+        if (!conn) {
+            perror("malloc for new connection failed");
+            return;
+        }
+        memset(conn, 0, sizeof(struct tcp_connection));
+
+        if (ntohl(src_ip.s_addr) < ntohl(dst_ip.s_addr)) {
+            conn->ip1 = src_ip;
+            conn->port1 = src_port;
+            conn->ip2 = dst_ip;
+            conn->port2 = dst_port;
+        } else {
+            conn->ip1 = dst_ip;
+            conn->port1 = dst_port;
+            conn->ip2 = src_ip;
+            conn->port2 = src_port;
+        }
+        conn->last_packet_time = time(NULL);
+        
+        conn->next = connection_list;
+        connection_list = conn;
+    }
+
+    if (conn) {
+        conn->last_packet_time = time(NULL);
+        struct flow_data *flow = NULL;
+
+        if (conn->ip1.s_addr == src_ip.s_addr && conn->port1 == src_port) {
+            flow = &conn->flow1_to_2;
+        } else {
+            flow = &conn->flow2_to_1;
+        }
+
+        flow->packets++;
+        flow->bytes += payload_len;
+
+        if (payload_len > 0 && flow->buffer_len < DATA_BUFFER_SIZE) {
+            int copy_len = payload_len;
+            if (flow->buffer_len + copy_len > DATA_BUFFER_SIZE) {
+                copy_len = DATA_BUFFER_SIZE - flow->buffer_len;
+            }
+            memcpy(flow->buffer + flow->buffer_len, data + tcp_hdr_len, copy_len);
+            flow->buffer_len += copy_len;
+        }
+
+        if (tcp_hdr->th_flags & TH_RST) {
+            print_and_free_connection(conn, "RST");
+        } else if (tcp_hdr->th_flags & TH_FIN) {
+            if(conn->fin_received){
+                print_and_free_connection(conn, "FIN");
+            } else {
+                conn->fin_received = 1;
+            }
+        }
+    }
+}
+
+
 //パケットの構造体へのヘッダ情報と生のポインタ
 void
 analyze(u_char *user, const struct pcap_pkthdr *pkhdr, const u_char *pktdata)
@@ -195,7 +467,6 @@ analyze(u_char *user, const struct pcap_pkthdr *pkhdr, const u_char *pktdata)
     static int cnt=0;                       //キャプチャのカウント
     struct ether_header *weh;               //パケットのヘッダ
     struct ip           *wih;               //ipヘッダ
-    struct udphdr       *wuh;               //udpヘッダ
     uint16_t ep;                            //イーサネットフレームタイプ
     u_char   *p;                            //パケットデータのポインタ
     time_t now;
@@ -206,32 +477,35 @@ analyze(u_char *user, const struct pcap_pkthdr *pkhdr, const u_char *pktdata)
     p   = (u_char*) pktdata;
     weh = (struct ether_header*)pktdata;
     if(weh) {                               //イーサネットヘッダがあれば
-        tm = localtime(&pkhdr->ts.tv_sec);
-        strftime(timestr, sizeof(timestr), "%H:%M:%S", tm);
-        printf("%s.%06lu ", timestr, (unsigned long)pkhdr->ts.tv_usec);
         ep  = ntohs(weh->ether_type);
 
         if(ep==ETHERTYPE_IP) {              //パケットタイプがIPの場合
             p += sizeof(struct ether_header);//イーサネットヘッダのサイズ分だけ進める
             wih = (struct ip*)p;            //ipヘッダの設定
-            p += wih->ip_hl * 4;            //プロトコルヘッダに移動
+            
+            tm = localtime(&pkhdr->ts.tv_sec);
+            strftime(timestr, sizeof(timestr), "%H:%M:%S", tm);
+            printf("%s.%06lu ", timestr, (unsigned long)pkhdr->ts.tv_usec);
+
+            int ip_hdr_len = wih->ip_hl * 4;
+            p += ip_hdr_len;            //プロトコルヘッダに移動
+
             if(wih && wih->ip_p == IPPROTO_UDP) {
-                wuh = (struct udphdr*)p;    //ポインタの設定
-                if(wuh) {
-                    printf("UDP sport %d dport %d\n",
-                        ntohs(wuh->uh_sport), ntohs(wuh->uh_dport));//UDPヘッダ(wuh)から送信元ポートと宛先ポートを取り出して画面に表示する
-                }
+                udp(p, ntohs(wih->ip_len) - ip_hdr_len, wih->ip_src, wih->ip_dst);
             }
             if(wih && wih->ip_p == IPPROTO_TCP){
-
+                tcp(p, ntohs(wih->ip_len) - ip_hdr_len, wih->ip_src, wih->ip_dst);
             }
             if(wih && wih->ip_p == IPPROTO_ICMP){
-                icmp(p, ntohs(wih->ip_len) - (wih->ip_hl * 4), wih->ip_src, wih->ip_dst);
+                icmp(p, ntohs(wih->ip_len) - ip_hdr_len, wih->ip_src, wih->ip_dst);
             }
 
         }
         if(ep==ETHERTYPE_ARP){
-            arp(p, pkhdr->caplen - sizeof(struct ether_header));
+            tm = localtime(&pkhdr->ts.tv_sec);
+            strftime(timestr, sizeof(timestr), "%H:%M:%S", tm);
+            printf("%s.%06lu ", timestr, (unsigned long)pkhdr->ts.tv_usec);
+            arp(p, pkhdr->caplen); 
         }
         fflush(stdout);
     }
@@ -281,22 +555,21 @@ timerloop(pcap_t *phand, int waittime)
     u_char *pktdata;
     int     ck;
     int     fd;
-    time_t  cur;
-    time_t  limit;
-
-    cur = time(NULL);
-    limit = cur + waittime;
+    time_t  last_check_time = time(NULL);
 
     fd = pcap_get_selectable_fd(phand);
 
-    while(cur<limit) {
-        if(isreadable(fd, 1, 0)) {
+    while(1) { 
+        if(isreadable(fd, 1, 0)) { 
             ck = pcap_next_ex(phand, &pkthdr, (const u_char**)&pktdata);
-            if(ck>0) {
+            if(ck > 0) {
                 analyze(NULL, pkthdr, pktdata);
             }
         }
-        cur = time(NULL);
+        if (time(NULL) - last_check_time >= 1) {
+            check_timeout_connections();
+            last_check_time = time(NULL);
+        }
     }
     return 0;
 }
@@ -367,10 +640,9 @@ main(int argc,char **argv)
         printf("pcap_lookupnet: %s\n", errbuf);
         exit(10);
     }
-    printf("net H  %08llx\n", (long long)htonl(net));
-    printf("mask H %08llx\n", (long long)htonl(netmask));
+    printf("net: %s, ", inet_ntoa(*(struct in_addr *)&net));
+    printf("netmask: %s\n", inet_ntoa(*(struct in_addr *)&netmask));
 
-    /*パケットをキャプチャ(デバイス名,キャプチャサイズ,プロミスキャスモード,timeout,errorbuf)*/
     phand = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
     if(phand == NULL) { 
         printf("pcap_open_live: %s\n",errbuf);
@@ -386,7 +658,13 @@ main(int argc,char **argv)
         exit(13);
     }
 
-    timerloop(phand, 50);   //関数を呼び出す
+    printf("Start capturing.\n");
+    timerloop(phand, -1);  
     
+    while (connection_list) {
+        print_and_free_connection(connection_list, "Shutdown");
+    }
+    
+    pcap_close(phand);
     return 0;
 }
